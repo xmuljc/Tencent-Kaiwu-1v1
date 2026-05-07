@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.claude/
+*.pkl
+kaiwu.json
+开悟RL/*.pdf
