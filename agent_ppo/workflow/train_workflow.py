@@ -225,6 +225,11 @@ class EpisodeRunner:
                 # 正常结束或超时退出，运行train_test时会提前退出
                 is_gameover = terminated or truncated or (is_train_test and frame_no >= 1000)
                 if is_gameover:
+                    if not is_eval:
+                        for do_sample, agent in zip(self.do_samples, self.agents):
+                            if do_sample:
+                                agent.reward_manager.record_episode_frame(frame_no)
+                                break
                     self.logger.info(
                         f"episode_{self.episode_cnt} terminated in fno_{frame_no}, truncated:{truncated}, eval:{is_eval}, reward_sum:{reward_sum_list[monitor_side]}"
                     )

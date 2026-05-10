@@ -34,6 +34,10 @@ def init_calc_frame_map():
 
 
 class GameRewardManager:
+    episode_frame_history = []
+    max_episode_frame_history = 20
+    default_stage_total_frames = 20000.0
+
     def __init__(self, main_hero_runtime_id):
         self.main_hero_player_id = main_hero_runtime_id
         self.main_hero_camp = -1
@@ -48,6 +52,24 @@ class GameRewardManager:
         self.time_scale_arg = GameConfig.TIME_SCALE_ARG
         self.m_main_hero_config_id = -1
         self.m_each_level_max_exp = {}
+
+    @classmethod
+    def record_episode_frame(cls, frame_no):
+        if frame_no <= 0:
+            return
+        cls.episode_frame_history.append(frame_no)
+        if len(cls.episode_frame_history) > cls.max_episode_frame_history:
+            cls.episode_frame_history = cls.episode_frame_history[-cls.max_episode_frame_history :]
+
+    @classmethod
+    def reset_episode_frame_history(cls):
+        cls.episode_frame_history = []
+
+    @classmethod
+    def get_stage_total_frames(cls):
+        if not cls.episode_frame_history:
+            return cls.default_stage_total_frames
+        return sum(cls.episode_frame_history) / len(cls.episode_frame_history)
 
     # Used to initialize the maximum experience value for each agent level
     # 用于初始化智能体各个等级的最大经验值
@@ -117,6 +139,16 @@ class GameRewardManager:
             # 前进
             elif reward_name == "forward":
                 reward_struct.cur_frame_value = self.calculate_forward(main_hero, main_tower, enemy_tower)
+            elif reward_name == "money":
+                reward_struct.cur_frame_value = self.calculate_money(main_hero)
+            elif reward_name == "exp":
+                reward_struct.cur_frame_value = self.calculate_exp(main_hero)
+            elif reward_name == "hp_advantage":
+                reward_struct.cur_frame_value = self.calculate_hp_rate(main_hero)
+            elif reward_name == "kill_death":
+                reward_struct.cur_frame_value = self.calculate_kill_death(main_hero)
+            elif reward_name == "win":
+                reward_struct.cur_frame_value = self.calculate_win(enemy_tower)
 
     # Calculate the forward reward based on the distance between the agent and both defensive towers
     # 用智能体到双方防御塔的距离，计算前进奖励
@@ -133,6 +165,58 @@ class GameRewardManager:
         if main_hero["hp"] / main_hero["max_hp"] > 0.99 and dist_hero2emy > dist_main2emy:
             forward_value = (dist_main2emy - dist_hero2emy) / dist_main2emy
         return forward_value
+
+    def calculate_money(self, main_hero):
+        return main_hero.get("money_cnt", main_hero.get("money", 0)) / 1000.0
+
+    def calculate_exp(self, main_hero):
+        level = main_hero.get("level", 1)
+        level_exp = 0
+        for hero_level in range(1, level):
+            level_exp += self.m_each_level_max_exp.get(hero_level, 0)
+        return (level_exp + main_hero.get("exp", 0)) / 1000.0
+
+    def calculate_hp_rate(self, main_hero):
+        if main_hero.get("max_hp", 0) <= 0:
+            return 0.0
+        return main_hero.get("hp", 0) / main_hero["max_hp"]
+
+    def calculate_kill_death(self, main_hero):
+        return main_hero.get("kill_cnt", 0) - main_hero.get("dead_cnt", 0)
+
+    def calculate_win(self, enemy_tower):
+        if enemy_tower.get("hp", 0) <= 0:
+            return 1.0
+        return 0.0
+
+    def get_stage_scales(self, frame_no):
+        progress = min(max(frame_no / self.get_stage_total_frames(), 0.0), 1.0)
+        if progress < 0.35:
+            return {
+                "tower_hp_point": 1.0,
+                "money": 1.3,
+                "exp": 1.2,
+                "hp_advantage": 1.2,
+                "kill_death": 0.8,
+                "win": 1.0,
+            }
+        if progress < 0.70:
+            return {
+                "tower_hp_point": 3.0,
+                "money": 1.0,
+                "exp": 1.0,
+                "hp_advantage": 1.0,
+                "kill_death": 1.0,
+                "win": 1.0,
+            }
+        return {
+            "tower_hp_point": 6.0,
+            "money": 0.3,
+            "exp": 0.3,
+            "hp_advantage": 0.5,
+            "kill_death": 0.6,
+            "win": 1.5,
+        }
 
     # Calculate the reward item information for both sides using frame data
     # 用帧数据来计算两边的奖励子项信息
@@ -153,9 +237,14 @@ class GameRewardManager:
     def get_reward(self, frame_data, reward_dict):
         reward_dict.clear()
         reward_sum, weight_sum = 0.0, 0.0
+        stage_scales = self.get_stage_scales(frame_data.get("frame_no", 0))
         for reward_name, reward_struct in self.m_cur_calc_frame_map.items():
             if reward_name == "forward":
                 reward_struct.value = self.m_main_calc_frame_map[reward_name].cur_frame_value
+            elif reward_name in ("money", "exp", "kill_death", "win"):
+                reward_struct.cur_frame_value = self.m_main_calc_frame_map[reward_name].cur_frame_value
+                reward_struct.last_frame_value = self.m_main_calc_frame_map[reward_name].last_frame_value
+                reward_struct.value = reward_struct.cur_frame_value - reward_struct.last_frame_value
             else:
                 # Calculate zero-sum reward
                 # 计算零和奖励
@@ -170,6 +259,6 @@ class GameRewardManager:
                 reward_struct.value = reward_struct.cur_frame_value - reward_struct.last_frame_value
 
             weight_sum += reward_struct.weight
-            reward_sum += reward_struct.value * reward_struct.weight
+            reward_sum += reward_struct.value * reward_struct.weight * stage_scales.get(reward_name, 1.0)
             reward_dict[reward_name] = reward_struct.value
         reward_dict["reward_sum"] = reward_sum
