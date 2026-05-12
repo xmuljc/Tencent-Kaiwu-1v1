@@ -12,13 +12,13 @@ class GameConfig:
     # Set the weight of each reward item and use it in reward_manager
     # 设置各个回报项的权重，在reward_manager中使用
     REWARD_WEIGHT_DICT = {
-        "tower_hp_point": 1.0,
+        "tower_hp_point": 0.6,
         "forward": 0.01,
         "money": 0.10,
         "exp": 0.06,
         "hp_advantage": 0.05,
-        "kill_death": 0.12,
-        "win": 1.0,
+        "kill_death": 0.25,
+        "win": 0.5,
     }
     # Time decay factor, used in reward_manager
     # 时间衰减因子，在reward_manager中使用
@@ -87,6 +87,7 @@ class Config:
     ]
 
     CLIP_PARAM = 0.2
+    DUAL_CLIP_PARAM = 2.0
 
     MIN_POLICY = 0.00001
 

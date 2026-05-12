@@ -92,10 +92,11 @@ class GameRewardManager:
 
     def result(self, frame_data):
         self.init_max_exp_of_each_hero()
+        frame_no = frame_data["frame_no"]
+        self.m_last_frame_no = frame_no
         self.frame_data_process(frame_data)
         self.get_reward(frame_data, self.m_reward_value)
 
-        frame_no = frame_data["frame_no"]
         if self.time_scale_arg > 0:
             for key in self.m_reward_value:
                 self.m_reward_value[key] *= math.pow(0.6, 1.0 * frame_no / self.time_scale_arg)
