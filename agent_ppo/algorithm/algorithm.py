@@ -108,8 +108,6 @@ class Algorithm:
             results["value_loss"] = round(value_loss, 2)
             results["policy_loss"] = round(policy_loss, 2)
             results["entropy_loss"] = round(entropy_loss, 2)
-            for key, value in self.model.monitor_data.items():
-                results[key] = round(value, 4)
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
             self.last_report_monitor_time = now

@@ -168,7 +168,6 @@ class EpisodeRunner:
             self.episode_cnt += 1
             frame_no = 0
             reward_sum_list = [0] * self.agent_num
-            reward_item_sum_list = [dict() for _ in range(self.agent_num)]
             is_train_test = os.environ.get("is_train_test", "False").lower() == "true"
             self.logger.info(f"Episode {self.episode_cnt} start, usr_conf is {usr_conf}")
 
@@ -179,7 +178,6 @@ class EpisodeRunner:
                     reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                     observation[str(i)]["reward"] = reward
                     reward_sum_list[i] += reward["reward_sum"]
-                    self._accumulate_reward_items(reward_item_sum_list[i], reward, agent.reward_manager)
 
             while True:
                 # Initialize the default actions. If the agent does not make a decision, env.step uses the default action.
@@ -222,17 +220,11 @@ class EpisodeRunner:
                         reward = agent.reward_manager.result(observation[str(i)]["frame_state"])
                         observation[str(i)]["reward"] = reward
                         reward_sum_list[i] += reward["reward_sum"]
-                        self._accumulate_reward_items(reward_item_sum_list[i], reward, agent.reward_manager)
 
                 # Normal end or timeout exit, run train_test will exit early
                 # 正常结束或超时退出，运行train_test时会提前退出
                 is_gameover = terminated or truncated or (is_train_test and frame_no >= 1000)
                 if is_gameover:
-                    if not is_eval:
-                        for do_sample, agent in zip(self.do_samples, self.agents):
-                            if do_sample:
-                                agent.reward_manager.record_episode_frame(frame_no)
-                                break
                     self.logger.info(
                         f"episode_{self.episode_cnt} terminated in fno_{frame_no}, truncated:{truncated}, eval:{is_eval}, reward_sum:{reward_sum_list[monitor_side]}"
                     )
@@ -247,21 +239,10 @@ class EpisodeRunner:
 
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60:
-                        stage_total_frames = self.agents[monitor_side].reward_manager.get_stage_total_frames()
-                        monitor_data = {
-                            "episode_cnt": self.episode_cnt,
-                            "episode_frame": frame_no,
-                            "stage_total_frames": stage_total_frames,
-                            "reward_stage_progress": min(max(frame_no / stage_total_frames, 0.0), 1.0),
-                        }
+                        monitor_data = {"episode_cnt": self.episode_cnt}
                         if self.monitor:
                             if is_eval:
                                 monitor_data["reward"] = round(reward_sum_list[monitor_side], 2)
-                                monitor_data["episode_reward_eval"] = round(reward_sum_list[monitor_side], 2)
-                            else:
-                                monitor_data["episode_reward_train"] = round(reward_sum_list[monitor_side], 2)
-                            for reward_name, reward_value in reward_item_sum_list[monitor_side].items():
-                                monitor_data[f"reward_{reward_name}"] = round(reward_value, 4)
                             self.monitor.put_data({os.getpid(): monitor_data})
                             self.last_report_monitor_time = now
 
@@ -271,17 +252,6 @@ class EpisodeRunner:
                         list_agents_samples = sample_process(frame_collector)
                         yield list_agents_samples
                     break
-
-    def _accumulate_reward_items(self, reward_item_sum, reward, reward_manager):
-        stage_scales = reward_manager.get_stage_scales(reward_manager.m_last_frame_no)
-        for reward_name, reward_value in reward.items():
-            if reward_name == "reward_sum":
-                continue
-            reward_struct = reward_manager.m_cur_calc_frame_map.get(reward_name)
-            if reward_struct is None:
-                continue
-            reward_contribution = reward_value * reward_struct.weight * stage_scales.get(reward_name, 1.0)
-            reward_item_sum[reward_name] = reward_item_sum.get(reward_name, 0.0) + reward_contribution
 
     def reset_agents(self, observation):
         opponent_agent = self.env_conf_manager.get_opponent_agent()

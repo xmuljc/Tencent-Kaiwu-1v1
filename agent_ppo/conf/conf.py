@@ -7,18 +7,15 @@
 Author: Tencent AI Arena Authors
 """
 
+from agent_ppo.feature.feature_process.debug_constants import BASE_FEATURE_DIM, DEBUG_FEATURE_DIM
+
 
 class GameConfig:
     # Set the weight of each reward item and use it in reward_manager
     # 设置各个回报项的权重，在reward_manager中使用
     REWARD_WEIGHT_DICT = {
-        "tower_hp_point": 0.6,
+        "tower_hp_point": 5.0,
         "forward": 0.01,
-        "money": 0.10,
-        "exp": 0.06,
-        "hp_advantage": 0.05,
-        "kill_death": 0.25,
-        "win": 0.5,
     }
     # Time decay factor, used in reward_manager
     # 时间衰减因子，在reward_manager中使用
@@ -31,8 +28,8 @@ class GameConfig:
 # Dimension configuration, used when building the model
 # 维度配置，构建模型时使用
 class DimConfig:
-    # Main hero(18) + Enemy hero(11) + Enemy tower(7) + Soldier(4) + GameState(4) = 44
-    DIM_OF_FEATURE = [44]
+    # V1 feature(44) + debug feature from buff/cake/actor metadata.
+    DIM_OF_FEATURE = [BASE_FEATURE_DIM + DEBUG_FEATURE_DIM]
 
 
 # Configuration related to model and algorithms used
@@ -41,9 +38,11 @@ class Config:
     NETWORK_NAME = "network"
     LSTM_TIME_STEPS = 16
     LSTM_UNIT_SIZE = 512
-    # feature(44) + legal_action(85) = 129 per frame
+    FEATURE_DIM = DimConfig.DIM_OF_FEATURE[0]
+    LEGAL_ACTION_DIM = 85
+    # feature + legal_action per frame
     DATA_SPLIT_SHAPE = [
-        44 + 85,
+        FEATURE_DIM + LEGAL_ACTION_DIM,
         1,
         1,
         1,
@@ -68,7 +67,7 @@ class Config:
         LSTM_UNIT_SIZE,
         LSTM_UNIT_SIZE,
     ]
-    SERI_VEC_SPLIT_SHAPE = [(44,), (85,)]
+    SERI_VEC_SPLIT_SHAPE = [(FEATURE_DIM,), (LEGAL_ACTION_DIM,)]
     INIT_LEARNING_RATE_START = 1e-3
     TARGET_LR = 1e-4
     TARGET_STEP = 5000
@@ -87,14 +86,13 @@ class Config:
     ]
 
     CLIP_PARAM = 0.2
-    DUAL_CLIP_PARAM = 2.0
 
     MIN_POLICY = 0.00001
 
     TARGET_EMBED_DIM = 32
 
     data_shapes = [
-        [(44 + 85) * 16],
+        [(FEATURE_DIM + LEGAL_ACTION_DIM) * LSTM_TIME_STEPS],
         [16],
         [16],
         [16],

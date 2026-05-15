@@ -129,7 +129,12 @@ class Agent(BaseAgent):
             torch_inputs[i] = data.float()
 
         feature, lstm_cell, lstm_hidden = torch_inputs
-        feature_vec = feature.reshape(-1, self.seri_vec_split_shape[0][0])
+        expected_feature_dim = self.seri_vec_split_shape[0][0]
+        if feature.numel() % expected_feature_dim != 0:
+            raise RuntimeError(
+                f"feature_dim mismatch: got {feature.numel()}, expected multiple of {expected_feature_dim}"
+            )
+        feature_vec = feature.reshape(-1, expected_feature_dim)
         lstm_hidden_state = lstm_hidden.reshape(-1, self.lstm_unit_size)
         lstm_cell_state = lstm_cell.reshape(-1, self.lstm_unit_size)
 
@@ -190,6 +195,9 @@ class Agent(BaseAgent):
             feature,
             observation["legal_action"],
         )
+        expected_feature_dim = self.seri_vec_split_shape[0][0]
+        if len(feature_vec) != expected_feature_dim:
+            raise RuntimeError(f"feature_dim mismatch: got {len(feature_vec)}, expected {expected_feature_dim}")
         return ObsData(
             feature=feature_vec, legal_action=legal_action, lstm_cell=self.lstm_cell, lstm_hidden=self.lstm_hidden
         )
@@ -223,12 +231,34 @@ class Agent(BaseAgent):
         if self.cur_model_name == model_file_path:
             self.logger.info(f"current model is {model_file_path}, so skip load model")
         else:
-            self.model.load_state_dict(
-                torch.load(
-                    model_file_path,
-                    map_location=self.device,
-                )
+            checkpoint = torch.load(
+                model_file_path,
+                map_location=self.device,
             )
+            model_state = self.model.state_dict()
+            compatible_checkpoint = {}
+            skipped_keys = []
+            for key, value in checkpoint.items():
+                if key in model_state and model_state[key].shape == value.shape:
+                    compatible_checkpoint[key] = value
+                elif (
+                    key in model_state
+                    and len(model_state[key].shape) == 2
+                    and len(value.shape) == 2
+                    and model_state[key].shape[0] == value.shape[0]
+                    and model_state[key].shape[1] >= value.shape[1]
+                ):
+                    merged_value = model_state[key].clone()
+                    merged_value[:, : value.shape[1]] = value
+                    compatible_checkpoint[key] = merged_value
+                    skipped_keys.append(f"{key}: partial input copy {value.shape[1]}->{model_state[key].shape[1]}")
+                else:
+                    skipped_keys.append(key)
+            self.model.load_state_dict(compatible_checkpoint, strict=False)
+            if skipped_keys:
+                self.logger.info(
+                    f"partial load model {model_file_path}, skipped incompatible keys: {skipped_keys}"
+                )
             self.cur_model_name = model_file_path
             self.logger.info(f"load model {model_file_path} successfully")
 

@@ -35,14 +35,12 @@ class Model(nn.Module):
         self.is_reinforce_task_list = Config.IS_REINFORCE_TASK_LIST
         self.min_policy = Config.MIN_POLICY
         self.clip_param = Config.CLIP_PARAM
-        self.dual_clip_param = Config.DUAL_CLIP_PARAM
         self.restore_list = []
         self.var_beta = self.m_var_beta
         self.learning_rate = self.m_learning_rate
         self.target_embed_dim = Config.TARGET_EMBED_DIM
         self.cut_points = [value[0] for value in Config.data_shapes]
         self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
-        self.monitor_data = {}
 
         self.feature_dim = Config.SERI_VEC_SPLIT_SHAPE[0][0]
         self.legal_action_dim = np.sum(Config.LEGAL_ACTION_SIZE_LIST)
@@ -189,33 +187,19 @@ class Model(nn.Module):
         # loss of value net
         # 值网络的损失
         fc2_value_result_squeezed = value_result.squeeze(dim=1)
-        self.value_cost = self._value_loss(fc2_value_result_squeezed, reward, frame_is_train)
-        self.monitor_data = {
-            "advantage_mean": self._to_float(self._masked_mean(advantage, frame_is_train)),
-            "advantage_abs_mean": self._to_float(self._masked_mean(torch.abs(advantage), frame_is_train)),
-            "negative_advantage_ratio": self._to_float(
-                self._masked_mean((advantage < 0).float(), frame_is_train)
-            ),
-            "return_mean": self._to_float(self._masked_mean(reward, frame_is_train)),
-            "value_mean": self._to_float(self._masked_mean(fc2_value_result_squeezed, frame_is_train)),
-            "value_error_abs": self._to_float(
-                self._masked_mean(torch.abs(reward - fc2_value_result_squeezed), frame_is_train)
-            ),
-        }
+        self.value_cost = 0.5 * torch.mean(torch.square(reward - fc2_value_result_squeezed), dim=0)
+        new_advantage = reward - fc2_value_result_squeezed
+        self.value_cost = 0.5 * torch.mean(torch.square(new_advantage), dim=0)
 
         # for entropy loss calculate
         # 用于熵损失计算
         label_probability_list = []
 
-        epsilon = self.log_epsilon
+        epsilon = 1e-5
 
         # policy loss: ppo clip loss
         # 策略损失：PPO剪辑损失
         self.policy_cost = torch.tensor(0.0)
-        ratio_sum = torch.tensor(0.0, device=advantage.device)
-        ratio_weight_sum = torch.tensor(0.0, device=advantage.device)
-        ratio_max = None
-        dual_clip_active_sum = torch.tensor(0.0, device=advantage.device)
         for task_index in range(len(self.is_reinforce_task_list)):
             if self.is_reinforce_task_list[task_index]:
                 final_log_p = torch.tensor(0.0)
@@ -250,33 +234,15 @@ class Model(nn.Module):
                 old_policy_log_p = torch.log(old_policy_p)
                 final_log_p = final_log_p + policy_log_p - old_policy_log_p
                 ratio = torch.exp(final_log_p)
-                clipped_surrogate = self._dual_clip_surrogate(ratio, advantage, self.clip_param, self.dual_clip_param)
-                monitor_mask = weight_list[task_index].float() * frame_is_train
-                ratio_sum = ratio_sum + torch.sum(ratio.detach() * monitor_mask)
-                ratio_weight_sum = ratio_weight_sum + torch.sum(monitor_mask)
-                valid_ratio = ratio.detach()[monitor_mask > 0]
-                if valid_ratio.numel() > 0:
-                    task_ratio_max = torch.max(valid_ratio)
-                    ratio_max = task_ratio_max if ratio_max is None else torch.maximum(ratio_max, task_ratio_max)
-                dual_clip_active_sum = dual_clip_active_sum + self._dual_clip_active_count(
-                    ratio.detach(),
-                    advantage.detach(),
-                    monitor_mask,
-                    self.clip_param,
-                    self.dual_clip_param,
-                )
+                clip_ratio = ratio.clamp(0.0, 3.0)
+
+                surr1 = clip_ratio * advantage
+                surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
                 temp_policy_loss = -torch.sum(
-                    clipped_surrogate * (weight_list[task_index].float()) * frame_is_train
+                    torch.minimum(surr1, surr2) * (weight_list[task_index].float()) * frame_is_train
                 ) / torch.maximum(torch.sum((weight_list[task_index].float()) * frame_is_train), torch.tensor(1.0))
 
                 self.policy_cost = self.policy_cost + temp_policy_loss
-
-        ratio_denominator = torch.maximum(ratio_weight_sum, torch.tensor(1.0, device=ratio_weight_sum.device))
-        self.monitor_data["ratio_mean"] = self._to_float(ratio_sum / ratio_denominator)
-        self.monitor_data["ratio_max"] = self._to_float(
-            ratio_max if ratio_max is not None else torch.tensor(0.0, device=advantage.device)
-        )
-        self.monitor_data["dual_clip_active_ratio"] = self._to_float(dual_clip_active_sum / ratio_denominator)
 
         # cross entropy loss
         # 交叉熵损失
@@ -313,37 +279,6 @@ class Model(nn.Module):
             self.loss,
             [self.value_cost, self.policy_cost, self.entropy_cost],
         ]
-
-    @staticmethod
-    def _dual_clip_surrogate(ratio, advantage, clip_param, dual_clip_param):
-        surrogate = ratio * advantage
-        clipped_surrogate = ratio.clamp(1.0 - clip_param, 1.0 + clip_param) * advantage
-        ppo_surrogate = torch.minimum(surrogate, clipped_surrogate)
-        dual_clipped_surrogate = torch.maximum(ppo_surrogate, dual_clip_param * advantage)
-        return torch.where(advantage < 0, dual_clipped_surrogate, ppo_surrogate)
-
-    @staticmethod
-    def _dual_clip_active_count(ratio, advantage, mask, clip_param, dual_clip_param):
-        surrogate = ratio * advantage
-        clipped_surrogate = ratio.clamp(1.0 - clip_param, 1.0 + clip_param) * advantage
-        ppo_surrogate = torch.minimum(surrogate, clipped_surrogate)
-        dual_clip_bound = dual_clip_param * advantage
-        active = ((advantage < 0) & (ppo_surrogate < dual_clip_bound)).float()
-        return torch.sum(active * mask)
-
-    @staticmethod
-    def _value_loss(value, returns, mask):
-        value_loss = torch.square(returns - value)
-        return 0.5 * torch.sum(value_loss * mask) / torch.maximum(torch.sum(mask), torch.tensor(1.0, device=mask.device))
-
-    @staticmethod
-    def _masked_mean(value, mask):
-        denominator = torch.maximum(torch.sum(mask), torch.tensor(1.0, device=mask.device))
-        return torch.sum(value * mask) / denominator
-
-    @staticmethod
-    def _to_float(value):
-        return float(value.detach().cpu().item())
 
     def set_train_mode(self):
         self.lstm_time_steps = Config.LSTM_TIME_STEPS
