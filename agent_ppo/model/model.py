@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+# -*- coding: UTF-8 -*-
+###########################################################################
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+###########################################################################
+"""
+Author: Tencent AI Arena Authors
+"""
+
+
+import torch
+import torch.nn as nn
+from torch.nn import ModuleDict
+
+import numpy as np
+from typing import List
+
+from agent_ppo.conf.conf import DimConfig, Config
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+        # feature configure parameter
+        # 特征配置参数
+        self.model_name = Config.NETWORK_NAME
+        self.data_split_shape = Config.DATA_SPLIT_SHAPE
+        self.lstm_time_steps = Config.LSTM_TIME_STEPS
+        self.lstm_unit_size = Config.LSTM_UNIT_SIZE
+        self.seri_vec_split_shape = Config.SERI_VEC_SPLIT_SHAPE
+        self.m_learning_rate = Config.INIT_LEARNING_RATE_START
+        self.m_var_beta = Config.BETA_START
+        self.log_epsilon = Config.LOG_EPSILON
+        self.label_size_list = Config.LABEL_SIZE_LIST
+        self.is_reinforce_task_list = Config.IS_REINFORCE_TASK_LIST
+        self.min_policy = Config.MIN_POLICY
+        self.clip_param = Config.CLIP_PARAM
+        self.restore_list = []
+        self.var_beta = self.m_var_beta
+        self.learning_rate = self.m_learning_rate
+        self.target_embed_dim = Config.TARGET_EMBED_DIM
+        self.cut_points = [value[0] for value in Config.data_shapes]
+        self.legal_action_size = Config.LEGAL_ACTION_SIZE_LIST
+
+        self.feature_dim = Config.SERI_VEC_SPLIT_SHAPE[0][0]
+        self.legal_action_dim = np.sum(Config.LEGAL_ACTION_SIZE_LIST)
+        self.lstm_hidden_dim = Config.LSTM_UNIT_SIZE
+
+        # NETWORK DIM
+        # 网络维度
+        self.hero_data_len = sum(Config.data_shapes[0])
+        self.feature_dim = int(DimConfig.DIM_OF_FEATURE[0])
+        self.main_hero_feature_dim = 151
+        self.enemy_hero_feature_dim = 133
+        self.main_tower_feature_dim = 13
+        self.enemy_tower_feature_dim = 13
+        self.hero_frd_slot_num = 1
+        self.hero_emy_slot_num = 1
+        self.organ_frd_slot_num = 1
+        self.organ_emy_slot_num = 1
+        self.friendly_soldier_slot_num = 4
+        self.enemy_soldier_slot_num = 4
+        self.soldier_slot_feature_dim = 15
+        self.enemy_soldier_feature_dim = self.soldier_slot_feature_dim
+        self.soldier_feature_dim = (
+            self.friendly_soldier_slot_num + self.enemy_soldier_slot_num
+        ) * self.soldier_slot_feature_dim
+        self.game_state_feature_dim = 8
+        self.river_spirit_feature_dim = 8
+        self.feature_segment_dims = [
+            self.main_hero_feature_dim,
+            self.enemy_hero_feature_dim,
+            self.main_tower_feature_dim,
+            self.enemy_tower_feature_dim,
+            self.soldier_feature_dim,
+            self.game_state_feature_dim,
+            self.river_spirit_feature_dim,
+        ]
+        self.unit_group_names = [
+            "hero_frd",
+            "hero_emy",
+            "soldier_frd",
+            "soldier_emy",
+            "organ_frd",
+            "organ_emy",
+        ]
+        self.unit_group_slot_nums = {
+            "hero_frd": self.hero_frd_slot_num,
+            "hero_emy": self.hero_emy_slot_num,
+            "soldier_frd": self.friendly_soldier_slot_num,
+            "soldier_emy": self.enemy_soldier_slot_num,
+            "organ_frd": self.organ_frd_slot_num,
+            "organ_emy": self.organ_emy_slot_num,
+        }
+
+        self.hero_frd_slot_mlp = MLP([self.main_hero_feature_dim, 128, 128, 128, 64], "hero_frd_slot_mlp")
+        self.hero_emy_slot_mlp = MLP([self.enemy_hero_feature_dim, 128, 128, 128, 64], "hero_emy_slot_mlp")
+        self.organ_frd_slot_mlp = MLP([self.main_tower_feature_dim, 64, 64, 64, 32], "organ_frd_slot_mlp")
+        self.organ_emy_slot_mlp = MLP([self.enemy_tower_feature_dim, 64, 64, 64, 32], "organ_emy_slot_mlp")
+        self.soldier_slot_mlp = MLP(
+            [self.soldier_slot_feature_dim, 64, 64, 64, 32],
+            "soldier_slot_mlp",
+        )
+        self.game_state_encoder = MLP([self.game_state_feature_dim, 32, 16], "game_state_encoder")
+        self.river_spirit_encoder = MLP([self.river_spirit_feature_dim, 32, 16], "river_spirit_encoder")
+
+        self.object_concat_dim = 64 + 64 + 32 + 32 + 32 + 32 + 16 + 16
+        self.concat_mlp = MLP([self.object_concat_dim, self.lstm_unit_size], "concat_mlp", non_linearity_last=True)
+        self.concat_mlp_other = MLP([self.object_concat_dim, 512, self.lstm_unit_size], "concat_mlp_other")
+        self.lstm_and_linear_mlp = MLP(
+            [self.lstm_unit_size * 2, self.lstm_unit_size],
+            "lstm_and_linear_mlp",
+            non_linearity_last=True,
+        )
+
+        self.lstm = torch.nn.LSTM(
+            input_size=self.lstm_unit_size,
+            hidden_size=self.lstm_unit_size,
+            num_layers=1,
+            bias=True,
+            batch_first=True,
+            dropout=0,
+            bidirectional=False,
+        )
+
+        self.label_mlp = ModuleDict(
+            {
+                "hero_label{0}_mlp".format(label_index): MLP(
+                    [self.lstm_unit_size, 256, self.label_size_list[label_index]],
+                    "hero_label{0}_mlp".format(label_index),
+                )
+                for label_index in range(len(self.label_size_list))
+            }
+        )
+        self.lstm_tar_embed_mlp = make_fc_layer(self.lstm_unit_size, self.target_embed_dim)
+
+        self.value_mlp = MLP([self.lstm_unit_size, 256, 1], "hero_value_mlp")
+
+        self.target_id_embedding = nn.Embedding(self.label_size_list[-1], self.target_embed_dim)
+        nn.init.orthogonal_(self.target_id_embedding.weight)
+        self.self_hero_target_mlp = MLP(
+            [self.main_hero_feature_dim, 64, self.target_embed_dim],
+            "self_hero_target_mlp",
+        )
+        self.enemy_hero_target_mlp = MLP(
+            [self.enemy_hero_feature_dim, 64, self.target_embed_dim],
+            "enemy_hero_target_mlp",
+        )
+        self.enemy_tower_target_mlp = MLP(
+            [self.enemy_tower_feature_dim, 64, self.target_embed_dim],
+            "enemy_tower_target_mlp",
+        )
+        self.enemy_soldier_target_mlp = MLP(
+            [self.enemy_soldier_feature_dim, 64, self.target_embed_dim],
+            "enemy_soldier_target_mlp",
+        )
+        self.river_sprite_target_mlp = MLP(
+            [self.river_spirit_feature_dim, 64, self.target_embed_dim],
+            "river_sprite_target_mlp",
+        )
+        self.target_embed_mlp = make_fc_layer(self.target_embed_dim, self.target_embed_dim, use_bias=False)
+
+    def forward(self, data_list, inference=False):
+        feature_vec, lstm_hidden_init, lstm_cell_init = data_list
+
+        # public concat
+        # 公共连接层 → output dim = lstm_unit_size
+        object_feature = self.encode_feature_objects(feature_vec)
+        fc_public_result = self.concat_mlp(object_feature)
+        public_mlp_result = self.concat_mlp_other(object_feature)
+
+        # LSTM for temporal modeling (skill combos, etc.)
+        # LSTM 时序建模（技能连招等）
+        # Training: [N*16, 512] → [N, 16, 512], unroll 16 time steps
+        # Inference: [1, 512] → [1, 1, 512], single time step
+        if inference:
+            lstm_input = fc_public_result.unsqueeze(1)  # [1, 1, 512]
+            h0 = lstm_hidden_init.unsqueeze(0)  # [1, 1, 512]
+            c0 = lstm_cell_init.unsqueeze(0)
+            lstm_out, (lstm_h, lstm_c) = self.lstm(lstm_input, (h0, c0))
+            lstm_features = lstm_out.squeeze(1)  # [1, 512]
+        else:
+            lstm_input = fc_public_result.reshape(-1, self.lstm_time_steps, self.lstm_unit_size)  # [N, 16, 512]
+            h0 = lstm_hidden_init.unsqueeze(0)  # [1, N, 512]
+            c0 = lstm_cell_init.unsqueeze(0)
+            lstm_out, (lstm_h, lstm_c) = self.lstm(lstm_input, (h0, c0))
+            lstm_features = lstm_out.reshape(-1, self.lstm_unit_size)  # [N*16, 512]
+
+        self.lstm_cell_output = lstm_c
+        self.lstm_hidden_output = lstm_h
+        lstm_features = self.lstm_and_linear_mlp(torch.cat([lstm_features, public_mlp_result], dim=1))
+
+        result_list = []
+
+        # output label
+        # 输出标签
+        for label_index, label_dim in enumerate(self.label_size_list[:-1]):
+            label_mlp_out = self.label_mlp["hero_label{0}_mlp".format(label_index)](lstm_features)
+            result_list.append(label_mlp_out)
+        target_logits = self._build_target_logits(feature_vec, lstm_features)
+        result_list.append(target_logits)
+
+        # output value
+        # 输出价值
+        value_result = self.value_mlp(lstm_features)
+        result_list.append(value_result)
+
+        # prepare for infer graph
+        # 准备推理图
+        logits = torch.flatten(torch.cat(result_list[:-1], 1), start_dim=1)
+        value = result_list[-1]
+
+        if inference:
+            return [logits, value, self.lstm_cell_output, self.lstm_hidden_output]
+        else:
+            return result_list
+
+    def encode_feature_objects(self, feature_vec):
+        (
+            main_hero_feature,
+            enemy_hero_feature,
+            main_tower_feature,
+            enemy_tower_feature,
+            soldier_feature,
+            game_state_feature,
+            river_spirit_feature,
+        ) = torch.split(
+            feature_vec,
+            self.feature_segment_dims,
+            dim=1,
+        )
+        hero_frd_feature = main_hero_feature.reshape(
+            -1,
+            self.hero_frd_slot_num,
+            self.main_hero_feature_dim,
+        )
+        hero_emy_feature = enemy_hero_feature.reshape(
+            -1,
+            self.hero_emy_slot_num,
+            self.enemy_hero_feature_dim,
+        )
+        organ_frd_feature = main_tower_feature.reshape(
+            -1,
+            self.organ_frd_slot_num,
+            self.main_tower_feature_dim,
+        )
+        organ_emy_feature = enemy_tower_feature.reshape(
+            -1,
+            self.organ_emy_slot_num,
+            self.enemy_tower_feature_dim,
+        )
+        friendly_soldier_feature, enemy_soldier_feature = torch.split(
+            soldier_feature,
+            [
+                self.friendly_soldier_slot_num * self.soldier_slot_feature_dim,
+                self.enemy_soldier_slot_num * self.soldier_slot_feature_dim,
+            ],
+            dim=1,
+        )
+        friendly_soldier_feature = friendly_soldier_feature.reshape(
+            -1,
+            self.friendly_soldier_slot_num,
+            self.soldier_slot_feature_dim,
+        )
+        enemy_soldier_feature = enemy_soldier_feature.reshape(
+            -1,
+            self.enemy_soldier_slot_num,
+            self.soldier_slot_feature_dim,
+        )
+        return torch.cat(
+            [
+                self.encode_unit_slots(hero_frd_feature, self.hero_frd_slot_mlp),
+                self.encode_unit_slots(hero_emy_feature, self.hero_emy_slot_mlp),
+                self.encode_unit_slots(friendly_soldier_feature, self.soldier_slot_mlp),
+                self.encode_unit_slots(enemy_soldier_feature, self.soldier_slot_mlp),
+                self.encode_unit_slots(organ_frd_feature, self.organ_frd_slot_mlp),
+                self.encode_unit_slots(organ_emy_feature, self.organ_emy_slot_mlp),
+                self.game_state_encoder(game_state_feature),
+                self.river_spirit_encoder(river_spirit_feature),
+            ],
+            dim=1,
+        )
+
+    def encode_unit_slots(self, unit_slots, slot_encoder, side_encoder=None):
+        slot_embedding = slot_encoder(unit_slots)
+        if side_encoder is not None:
+            slot_embedding = side_encoder(slot_embedding)
+        return torch.max(slot_embedding, dim=1).values
+
+    def encode_soldier_slots(self, soldier_slots, side_fc):
+        slot_embedding = self.soldier_slot_mlp(soldier_slots)
+        side_embedding = side_fc(slot_embedding)
+        return torch.max(side_embedding, dim=1).values
+
+    def _build_target_logits(self, feature_vec, lstm_features):
+        (
+            main_hero_feature,
+            enemy_hero_feature,
+            main_tower_feature,
+            enemy_tower_feature,
+            soldier_feature,
+            game_state_feature,
+            river_spirit_feature,
+        ) = torch.split(
+            feature_vec,
+            [
+                self.main_hero_feature_dim,
+                self.enemy_hero_feature_dim,
+                self.main_tower_feature_dim,
+                self.enemy_tower_feature_dim,
+                self.soldier_feature_dim,
+                self.game_state_feature_dim,
+                self.river_spirit_feature_dim,
+            ],
+            dim=1,
+        )
+
+        batch_size = feature_vec.shape[0]
+        target_id_embedding = self.target_id_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        _, enemy_soldier_feature = torch.split(
+            soldier_feature,
+            [
+                self.friendly_soldier_slot_num * self.soldier_slot_feature_dim,
+                self.enemy_soldier_slot_num * self.enemy_soldier_feature_dim,
+            ],
+            dim=1,
+        )
+        enemy_soldier_feature = enemy_soldier_feature.reshape(
+            -1, self.enemy_soldier_slot_num, self.enemy_soldier_feature_dim
+        )
+        enemy_soldier_embedding = self.enemy_soldier_target_mlp(enemy_soldier_feature)
+
+        candidate_embeddings = torch.stack(
+            [
+                target_id_embedding[:, 0],
+                target_id_embedding[:, 1] + self.enemy_hero_target_mlp(enemy_hero_feature),
+                target_id_embedding[:, 2] + self.self_hero_target_mlp(main_hero_feature),
+                target_id_embedding[:, 3] + enemy_soldier_embedding[:, 0],
+                target_id_embedding[:, 4] + enemy_soldier_embedding[:, 1],
+                target_id_embedding[:, 5] + enemy_soldier_embedding[:, 2],
+                target_id_embedding[:, 6] + enemy_soldier_embedding[:, 3],
+                target_id_embedding[:, 7] + self.enemy_tower_target_mlp(enemy_tower_feature),
+                target_id_embedding[:, 8] + self.river_sprite_target_mlp(river_spirit_feature),
+            ],
+            dim=1,
+        )
+        candidate_embeddings = self.target_embed_mlp(candidate_embeddings)
+        target_query = self.lstm_tar_embed_mlp(lstm_features).unsqueeze(2)
+        return torch.matmul(candidate_embeddings, target_query).squeeze(2) / np.sqrt(self.target_embed_dim)
+
+    def compute_loss(self, data_list, rst_list):
+        seri_vec = data_list[0].reshape(-1, self.data_split_shape[0])
+        usq_reward = data_list[1].reshape(-1, self.data_split_shape[1])
+        usq_advantage = data_list[2].reshape(-1, self.data_split_shape[2])
+        usq_is_train = data_list[-3].reshape(-1, self.data_split_shape[-3])
+
+        usq_label_list = data_list[3 : 3 + len(self.label_size_list)]
+        for shape_index in range(len(self.label_size_list)):
+            usq_label_list[shape_index] = (
+                usq_label_list[shape_index].reshape(-1, self.data_split_shape[3 + shape_index]).long()
+            )
+
+        old_label_probability_list = data_list[3 + len(self.label_size_list) : 3 + 2 * len(self.label_size_list)]
+        for shape_index in range(len(self.label_size_list)):
+            old_label_probability_list[shape_index] = old_label_probability_list[shape_index].reshape(
+                -1, self.data_split_shape[3 + len(self.label_size_list) + shape_index]
+            )
+
+        usq_weight_list = data_list[3 + 2 * len(self.label_size_list) : 3 + 3 * len(self.label_size_list)]
+        for shape_index in range(len(self.label_size_list)):
+            usq_weight_list[shape_index] = usq_weight_list[shape_index].reshape(
+                -1,
+                self.data_split_shape[3 + 2 * len(self.label_size_list) + shape_index],
+            )
+
+        # squeeze tensor
+        # 压缩张量
+        reward = usq_reward.squeeze(dim=1)
+        advantage = usq_advantage.squeeze(dim=1)
+        label_list = []
+        for ele in usq_label_list:
+            label_list.append(ele.squeeze(dim=1))
+        weight_list = []
+        for weight in usq_weight_list:
+            weight_list.append(weight.squeeze(dim=1))
+        frame_is_train = usq_is_train.squeeze(dim=1)
+
+        label_result = rst_list[:-1]
+
+        value_result = rst_list[-1]
+
+        _, split_feature_legal_action = torch.split(
+            seri_vec,
+            [
+                np.prod(self.seri_vec_split_shape[0]),
+                np.prod(self.seri_vec_split_shape[1]),
+            ],
+            dim=1,
+        )
+        feature_legal_action_shape = list(self.seri_vec_split_shape[1])
+        feature_legal_action_shape.insert(0, -1)
+        feature_legal_action = split_feature_legal_action.reshape(feature_legal_action_shape)
+
+        legal_action_flag_list = torch.split(feature_legal_action, self.label_size_list, dim=1)
+
+        # loss of value net
+        # 值网络的损失
+        fc2_value_result_squeezed = value_result.squeeze(dim=1)
+        self.value_cost = 0.5 * torch.mean(torch.square(reward - fc2_value_result_squeezed), dim=0)
+        new_advantage = reward - fc2_value_result_squeezed
+        self.value_cost = 0.5 * torch.mean(torch.square(new_advantage), dim=0)
+
+        # for entropy loss calculate
+        # 用于熵损失计算
+        label_probability_list = []
+
+        epsilon = 1e-5
+
+        # policy loss: ppo clip loss
+        # 策略损失：PPO剪辑损失
+        self.policy_cost = torch.tensor(0.0)
+        for task_index in range(len(self.is_reinforce_task_list)):
+            if self.is_reinforce_task_list[task_index]:
+                final_log_p = torch.tensor(0.0)
+                boundary = torch.pow(torch.tensor(10.0), torch.tensor(20.0))
+                one_hot_actions = nn.functional.one_hot(label_list[task_index].long(), self.label_size_list[task_index])
+
+                legal_action_flag_list_max_mask = (1 - legal_action_flag_list[task_index]) * boundary
+
+                label_logits_subtract_max = torch.clamp(
+                    label_result[task_index]
+                    - torch.max(
+                        label_result[task_index] - legal_action_flag_list_max_mask,
+                        dim=1,
+                        keepdim=True,
+                    ).values,
+                    -boundary,
+                    1,
+                )
+
+                label_exp_logits = (
+                    legal_action_flag_list[task_index] * torch.exp(label_logits_subtract_max) + self.min_policy
+                )
+
+                label_sum_exp_logits = label_exp_logits.sum(1, keepdim=True)
+
+                label_probability = 1.0 * label_exp_logits / label_sum_exp_logits
+                label_probability_list.append(label_probability)
+
+                policy_p = (one_hot_actions * label_probability).sum(1)
+                policy_log_p = torch.log(policy_p + epsilon)
+                old_policy_p = (one_hot_actions * old_label_probability_list[task_index] + epsilon).sum(1)
+                old_policy_log_p = torch.log(old_policy_p)
+                final_log_p = final_log_p + policy_log_p - old_policy_log_p
+                ratio = torch.exp(final_log_p)
+                clip_ratio = ratio.clamp(0.0, 3.0)
+
+                surr1 = clip_ratio * advantage
+                surr2 = ratio.clamp(1.0 - self.clip_param, 1.0 + self.clip_param) * advantage
+                temp_policy_loss = -torch.sum(
+                    torch.minimum(surr1, surr2) * (weight_list[task_index].float()) * frame_is_train
+                ) / torch.maximum(torch.sum((weight_list[task_index].float()) * frame_is_train), torch.tensor(1.0))
+
+                self.policy_cost = self.policy_cost + temp_policy_loss
+
+        # cross entropy loss
+        # 交叉熵损失
+        current_entropy_loss_index = 0
+        entropy_loss_list = []
+        for task_index in range(len(self.is_reinforce_task_list)):
+            if self.is_reinforce_task_list[task_index]:
+                temp_entropy_loss = -torch.sum(
+                    label_probability_list[current_entropy_loss_index]
+                    * legal_action_flag_list[task_index]
+                    * torch.log(label_probability_list[current_entropy_loss_index] + epsilon),
+                    dim=1,
+                )
+
+                temp_entropy_loss = -torch.sum(
+                    (temp_entropy_loss * weight_list[task_index].float() * frame_is_train)
+                ) / torch.maximum(torch.sum(weight_list[task_index].float() * frame_is_train), torch.tensor(1.0))
+
+                entropy_loss_list.append(temp_entropy_loss)
+                current_entropy_loss_index = current_entropy_loss_index + 1
+            else:
+                temp_entropy_loss = torch.tensor(0.0)
+                entropy_loss_list.append(temp_entropy_loss)
+
+        self.entropy_cost = torch.tensor(0.0)
+        for entropy_element in entropy_loss_list:
+            self.entropy_cost = self.entropy_cost + entropy_element
+
+        self.entropy_cost_list = entropy_loss_list
+
+        self.loss = self.value_cost + self.policy_cost + self.var_beta * self.entropy_cost
+
+        return self.loss, [
+            self.loss,
+            [self.value_cost, self.policy_cost, self.entropy_cost],
+        ]
+
+    def set_train_mode(self):
+        self.lstm_time_steps = Config.LSTM_TIME_STEPS
+        self.train()
+
+    def set_eval_mode(self):
+        self.lstm_time_steps = 1
+        self.eval()
+
+
+def make_fc_layer(in_features: int, out_features: int, use_bias=True):
+    fc_layer = nn.Linear(in_features, out_features, bias=use_bias)
+
+    nn.init.orthogonal(fc_layer.weight)
+    if use_bias:
+        nn.init.zeros_(fc_layer.bias)
+
+    return fc_layer
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        fc_feat_dim_list: List[int],
+        name: str,
+        non_linearity: nn.Module = nn.ReLU,
+        non_linearity_last: bool = False,
+    ):
+        super(MLP, self).__init__()
+        self.fc_layers = nn.Sequential()
+        for i in range(len(fc_feat_dim_list) - 1):
+            fc_layer = make_fc_layer(fc_feat_dim_list[i], fc_feat_dim_list[i + 1])
+            self.fc_layers.add_module("{0}_fc{1}".format(name, i + 1), fc_layer)
+            if i + 1 < len(fc_feat_dim_list) - 1 or non_linearity_last:
+                self.fc_layers.add_module("{0}_non_linear{1}".format(name, i + 1), non_linearity())
+
+    def forward(self, data):
+        return self.fc_layers(data)
